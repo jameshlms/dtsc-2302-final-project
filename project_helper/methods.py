@@ -1,15 +1,20 @@
 from pandas import DataFrame, Series
-from numpy import ndarray
 import numpy as np
+import statsmodels.api as sm
+from sklearn.linear_model import LinearRegression
+import sklearn.metrics as metrics
 
-from typing import Generator, Sequence, Tuple
+import itertools
+from typing import Generator, List, Literal, Sequence, Tuple
+from joblib import Parallel, delayed
+import math
 
 
 def trn_vld_tst_split(
-    features: ndarray | DataFrame,
-    target: ndarray | Series,
+    features: DataFrame,
+    target: Series,
     train_size: float = 0.8,
-) -> Tuple[ndarray, ndarray, ndarray, ndarray, ndarray, ndarray]:
+) -> Tuple[DataFrame, Series, DataFrame, Series, DataFrame, Series]:
     """Creates a tuple of train, validation, and testings splits for the features and targets provided.
 
     For index pairs (i, i+1):
@@ -33,19 +38,8 @@ def trn_vld_tst_split(
         X_trn, y_trn, X_vld, y_vld, X_tst, y_tst = trn_vld_tst_split(X, y)
         ```
     """
-    if isinstance(features, DataFrame):
-        X = features.to_numpy()
-    elif isinstance(features, ndarray):
-        X = features.copy()
-    else:
-        raise TypeError("'features' is not of type DataFrame or ndarray")
-
-    if isinstance(target, Series):
-        y = target.to_numpy()
-    elif isinstance(target, ndarray):
-        y = target.copy()
-    else:
-        raise TypeError("'target' is not of type Series or ndarray")
+    X = features.copy()
+    y = target.copy()
 
     if len(X) != len(y):
         raise AttributeError(
@@ -59,12 +53,12 @@ def trn_vld_tst_split(
     tst_start = int(length * ((1 - train_size) / 2)) + vld_start
 
     return (
-        X[(trn_indices := indices[:vld_start])],
-        y[trn_indices],
-        X[(vld_indices := indices[vld_start:tst_start])],
-        y[vld_indices],
-        X[(tst_indices := indices[tst_start:])],
-        y[tst_indices],
+        X.iloc[(trn_indices := indices[:vld_start])],
+        y.iloc[trn_indices],
+        X.iloc[(vld_indices := indices[vld_start:tst_start])],
+        y.iloc[vld_indices],
+        X.iloc[(tst_indices := indices[tst_start:])],
+        y.iloc[tst_indices],
     )
 
 
@@ -100,3 +94,200 @@ def get_npa_records(
         record["variable_id_adj"] = range(1, len(record) + 1)
 
         yield record[col_name]
+
+
+def top_k_models(
+    k: int,
+    X: DataFrame,
+    y: Series,
+    *,
+    X_vld: DataFrame = None,
+    y_vld: Series = None,
+    use_metric: Literal["rmse", "r2"] = "rmse",
+    n_jobs: int = 1,
+):
+    total_combins = math.comb(len(X.columns), k)
+    interval_in_tenths = max(total_combins // 10, 1)
+
+    print(f"Total possible combination: {total_combins}")
+
+    X_trn, y_trn = X, y
+
+    X_val = X if X_vld is None else X_vld
+    y_val = y if y_vld is None else y_vld
+
+    if use_metric == "rmse":
+        metric_func = metrics.root_mean_squared_error
+        compare = np.less
+
+    else:
+        metric_func = metrics.r2_score
+        compare = np.greater
+
+    def process_subset(cols):
+        X_sub = X_trn[cols]
+        model = LinearRegression(fit_intercept=True).fit(X_sub, y_trn)
+        y_pred = model.predict(X_val[cols])
+
+        return cols, metric_func(y_val, y_pred)
+
+    best_cols, best_metric = None, None
+
+    processed = 0
+
+    combo_iter = itertools.combinations(X_trn.columns, k)
+
+    for per in range(1, 11):
+        combin_chunk = list(itertools.islice(combo_iter, interval_in_tenths))
+
+        if not combin_chunk:
+            break
+
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(process_subset)(list(col_combin)) for col_combin in combin_chunk
+        )
+
+        for cols, metric in results:
+            if best_metric is None or compare(metric, best_metric):
+                best_cols, best_metric = cols, metric
+
+        processed += len(combin_chunk)
+        print(f"top_k_models progress: {min(per * 10, 100)}% done")
+
+    leftover = list(combo_iter)
+    if leftover:
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(process_subset)(list(col_combin)) for col_combin in leftover
+        )
+        for cols, metric in results:
+            if metric is not None and (
+                best_metric is None or compare(metric, best_metric)
+            ):
+                best_metric, best_cols = metric, cols
+        processed += len(leftover)
+        print("top_k_models progress: finishing up")
+
+    for col_combin in itertools.combinations(X_trn.columns, k):
+        cols = list(col_combin)
+
+        X_sub = X_trn[cols]
+        X_val_sub = X_val[cols]
+
+        model = LinearRegression(fit_intercept=True).fit(X_sub, y_trn)
+        y_pred = model.predict(X_val_sub)
+
+        metric = metric_func(y_val, y_pred)
+
+        if compare(metric, best_metric):
+            best_metric, best_cols = metric, cols
+
+    X_trn, y_trn, X_val, y_val, X_sub, X_val_sub = [None] * 6
+
+    return best_metric, best_cols
+
+
+def top_k_feats(
+    k: int,
+    X: DataFrame,
+    y: Series,
+    *,
+    X_vld: DataFrame = None,
+    y_vld: Series = None,
+    use_metric: Literal["rmse", "r2"] = "rmse",
+    n_jobs: int = 1,  # One core by default just to be safe
+    candidates: int = 1,
+):
+    num_combins = math.comb(len(X.columns), k)
+    interval = max(num_combins // 10, 1)
+
+    print(f"Total possible combinations: {num_combins}")
+
+    X_trn, y_trn = X, y
+
+    X_val = X if X_vld is None else X_vld
+    y_val = y if y_vld is None else y_vld
+
+    if use_metric == "r2":
+        metric_func = metrics.root_mean_squared_error
+        compare = np.less
+
+    else:
+        metric_func = metrics.r2_score
+        compare = np.greater
+
+    def process_subset(cols):
+        X_sub = X_trn[cols]
+        model = LinearRegression(fit_intercept=True).fit(X_sub, y_trn)
+        y_pred = model.predict(X_val[cols])
+
+        return cols, metric_func(y_val, y_pred)
+
+    best_cols, best_metric = None, None
+
+    processed = 0
+
+    combo_iter = itertools.combinations(X_trn.columns, k)
+
+    for _ in range(1, 11):
+        combin_chunk = list(itertools.islice(combo_iter, interval))
+        processed += len(combin_chunk)
+
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(process_subset)(list(col_combin)) for col_combin in combin_chunk
+        )
+
+        for cols, metric in results:
+            if best_metric is None or compare(metric, best_metric):
+                best_cols, best_metric = cols, metric
+
+        print(f"Progress: {(processed / num_combins):.0%}")
+
+    if leftover := list(combo_iter):
+        processed += len(leftover)
+
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(process_subset)(list(col_combin)) for col_combin in combin_chunk
+        )
+
+        for cols, metric in results:
+            if best_metric is None or compare(metric, best_metric):
+                best_cols, best_metric = cols, metric
+
+        print("Progress: Finishing up...")
+
+    X_trn, y_trn, X_val, y_val, X_sub, X_val_sub = [None] * 6
+
+    return best_metric, best_cols
+
+
+def get_recent_cols(dataframe: DataFrame) -> List[str]:
+    var_prefix: str = ""
+    prev_col: str = ""
+    usecols: List[str] = []
+    for col in dataframe.columns:
+        if len(split := col.split("-")) != 2 and not split[1].isnumeric():
+            continue
+
+        prefix: str = split[0]
+
+        if var_prefix != prefix and prev_col:
+            usecols.append(prev_col)
+
+        prev_col = col
+        var_prefix = prefix
+
+    return usecols
+
+
+def get_2023_cols(dataframe: DataFrame) -> List[str]:
+    usecols = []
+
+    for col in dataframe.columns:
+        if len(split := col.split("-")) > 1 and split[-1] == "2023":
+            usecols.append(col)
+
+    return usecols
+
+
+def standardize_df(dataframe: DataFrame) -> DataFrame:
+    return (dataframe - dataframe.mean()) / dataframe.std()
